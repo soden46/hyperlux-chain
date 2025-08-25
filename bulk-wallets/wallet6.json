@@ -1,0 +1,8 @@
+{
+  "address_ed": "hlcEd65fafa59",
+  "address_sec": "hlcSec7ff647ed",
+  "priv_ed": "4f73630917af3059ca6fc9d5a5853c9ef1d9b041c091cb15006edae315cf141665fafa59a8f1c66e80960323b8a560931c062b4bcebd5040ee0f3aa54868a284",
+  "priv_sec": "cc72f2c43966c3f7fc3c040297273d2c51aafd782137471ab8b6a03b0c52f5b7",
+  "pub_ed": "65fafa59a8f1c66e80960323b8a560931c062b4bcebd5040ee0f3aa54868a284",
+  "pub_sec": "02bb87c1ce25940c8d13830ecefc3d6e44af97cb796223a343d4ba37611c80e7a6"
+}
