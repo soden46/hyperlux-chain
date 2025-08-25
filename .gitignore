@@ -1,0 +1,27 @@
+# Direktori dan file yang tidak perlu dilacak oleh Git
+
+# File database LevelDB
+# Ini berisi state blockchain, mempool, dll. Data ini bersifat lokal dan tidak boleh di-commit.
+/hyperlux.db/
+/hyperlux_db/
+
+# File-file yang berisi kunci privat dan informasi validator
+# Direktori ini sangat penting untuk dikecualikan demi keamanan.
+/bulk-wallets/
+
+# Direktori yang dihasilkan oleh Go saat mengelola dependensi.
+# Kecualikan modul Go.
+/go.sum
+
+# File yang dihasilkan oleh Go untuk profiling CPU dan memori.
+# Berguna untuk debugging lokal, tapi tidak perlu di-commit.
+*.prof
+
+# File kunci yang kemungkinan berisi kredensial sensitif.
+# Kecualikan ini untuk menghindari kebocoran data.
+keystore.json
+
+# File JSON yang berisi data state blockchain yang dihasilkan.
+# Ini adalah output dari program, bukan sumber kode.
+validators.json
+wallet*.json
