@@ -25,3 +25,6 @@ keystore.json
 # Ini adalah output dari program, bukan sumber kode.
 validators.json
 wallet*.json
+validators/*
+data/*
+config/genesis.json
