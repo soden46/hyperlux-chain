@@ -8,6 +8,7 @@ import (
 	"os"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -67,6 +68,17 @@ func RunCLI() {
 		handleFixValidators()
 	case "full-test":
 		handleFullTest()
+
+	// ================= VALIDATOR SECURITY (baru) =================
+	case "validator-status":
+		handleValidatorStatus()
+	case "suspend":
+		handleSuspend()
+	case "slash":
+		handleSlash()
+	case "show-econ":
+		handleShowEcon()
+
 	default:
 		fmt.Println("Unknown command:", cmd)
 		printUsage()
@@ -92,6 +104,12 @@ func printUsage() {
 	fmt.Println(" - airdrop <amount> <folder>")
 	fmt.Println(" - fix-validators         - Memperbaiki data validator")
 	fmt.Println(" - full-test <walletCount> <perWallet> <intervalSeconds>")
+	fmt.Println("")
+	fmt.Println("Validator & Security:")
+	fmt.Println(" - validator-status <address>")
+	fmt.Println(" - suspend <address> <scope:propose|vote|all> <duration:e.g. 15m,2h,24h>")
+	fmt.Println(" - slash <address> <amount> [reporterAddress]")
+	fmt.Println(" - show-econ              - Tampilkan treasury, burned, total stake, dsb.")
 }
 
 // Pastikan validator & wallet validator tersedia di memori (tanpa start consensus producer)
@@ -432,7 +450,7 @@ func handleMetrics() {
 	fmt.Printf("🧱 Last Block    : #%d  (hash=%.12s...)\n", last.Index, last.Hash)
 	fmt.Printf("   TX in Block   : %d\n", len(last.Transactions))
 
-	// Block time: selisih dua blok terakhir, bukan now - last.Timestamp
+	// Block time: selisih dua blok terakhir
 	if height >= 2 {
 		prev := ledger.Blockchain[height-2]
 		dt := last.Timestamp - prev.Timestamp
@@ -535,8 +553,8 @@ func handleFullTest() {
 	fmt.Println("🚀 Menyiapkan dan memulai pengujian penuh...")
 
 	// 1) Sinkronisasi & siapkan validator + wallet validators di memori
-	ledger.FixValidators()           // buat/repair daftar validator & file wallet validator
-	ledger.LoadValidators()          // muat validator ke memori
+	ledger.FixValidators()            // buat/repair daftar validator & file wallet validator
+	ledger.LoadValidators()           // muat validator ke memori
 	ledger.AutoLoadValidatorWallets() // muat wallet validator (agar CommitBlock tidak gagal)
 	ledger.SaveAllData()
 	fmt.Println("✅ Validator berhasil didaftarkan dan disimpan.")
@@ -600,4 +618,186 @@ func handleFullTest() {
 		time.Sleep(time.Duration(interval) * time.Second)
 	}
 	fmt.Println("✅ Stress test selesai.")
+}
+
+// ===================== VALIDATOR SECURITY COMMANDS =====================
+
+func handleValidatorStatus() {
+	// Usage: validator-status <address>
+	if len(os.Args) < 3 {
+		fmt.Println("Usage: hyperlux -validator-status <address>")
+		return
+	}
+	addr := os.Args[2]
+	ensureValidatorsReady()
+
+	// cari validator
+	found := false
+	stake := 0
+	for _, v := range ledger.Validators {
+		if v.Address == addr {
+			found = true
+			stake = v.Stake
+			break
+		}
+	}
+	if !found {
+		fmt.Printf("❌ %s tidak terdaftar sebagai validator\n", addr)
+		return
+	}
+
+	// status suspend
+	sProp := ledger.IsSuspended(addr, ledger.ScopePropose)
+	sVote := ledger.IsSuspended(addr, ledger.ScopeVote)
+	sAll := ledger.IsSuspended(addr, ledger.ScopeAll)
+
+	// baca runtime record untuk detail until/scope
+	ledger.ValidatorStatusMu.RLock()
+	rt := ledger.ValidatorStatus[addr]
+	ledger.ValidatorStatusMu.RUnlock()
+
+	var untilStr, scopeStr string
+	if rt != nil && time.Now().Unix() < rt.SuspendedUntil {
+		untilStr = time.Unix(rt.SuspendedUntil, 0).Format(time.RFC3339)
+		scopeStr = scopeToString(rt.SuspendScope)
+	} else {
+		untilStr = "-"
+		scopeStr = "-"
+	}
+
+	// wallet
+	_, hasWallet := ledger.ValidatorWallets[addr]
+
+	fmt.Println("🧾 Validator Status")
+	fmt.Println("-------------------")
+	fmt.Printf("Address          : %s\n", addr)
+	fmt.Printf("Stake            : %d\n", stake)
+	fmt.Printf("Wallet Loaded    : %v\n", hasWallet)
+	fmt.Printf("Suspended(Propose): %v\n", sProp)
+	fmt.Printf("Suspended(Vote)   : %v\n", sVote)
+	fmt.Printf("Suspended(All)    : %v\n", sAll)
+	fmt.Printf("Suspension Scope  : %s\n", scopeStr)
+	fmt.Printf("Suspended Until   : %s\n", untilStr)
+}
+
+func handleSuspend() {
+	// Usage: suspend <address> <scope:propose|vote|all> <duration:15m|2h|24h>
+	if len(os.Args) < 5 {
+		fmt.Println("Usage: hyperlux -suspend <address> <scope:propose|vote|all> <duration>")
+		return
+	}
+	addr := os.Args[2]
+	scopeStr := strings.ToLower(os.Args[3])
+	durStr := os.Args[4]
+
+	scope, ok := parseScope(scopeStr)
+	if !ok {
+		fmt.Println("❌ scope harus salah satu dari: propose, vote, all")
+		return
+	}
+	dur, err := time.ParseDuration(durStr)
+	if err != nil {
+		fmt.Println("❌ duration invalid. contoh: 15m, 2h, 24h")
+		return
+	}
+
+	ledger.SuspendValidator(addr, scope, dur)
+	fmt.Printf("✅ %s disuspend scope=%s durasi=%s\n", addr, scopeStr, durStr)
+}
+
+func handleSlash() {
+	// Usage: slash <address> <amount> [reporterAddress]
+	if len(os.Args) < 4 {
+		fmt.Println("Usage: hyperlux -slash <address> <amount> [reporterAddress]")
+		return
+	}
+	addr := os.Args[2]
+	amount, err := strconv.Atoi(os.Args[3])
+	if err != nil || amount <= 0 {
+		fmt.Println("❌ amount harus bilangan bulat > 0")
+		return
+	}
+	reporter := ""
+	if len(os.Args) >= 5 && os.Args[4] != "-" {
+		reporter = os.Args[4]
+	}
+
+	ensureValidatorsReady()
+
+	ledger.SlashSafetyFault(addr, amount, reporter, 1.0)
+	// persist perubahan stake + distribusi hadiah ke balance
+	ledger.SaveValidators()
+	ledger.SaveBalances()
+
+	fmt.Printf("✅ Slash sukses. Offender=%s amount=%d reporter=%s\n", addr, amount, reporter)
+}
+
+func handleShowEcon() {
+	fmt.Println("💰 Economic Metrics")
+	fmt.Println("-------------------")
+
+	// Treasury & Burned
+	fmt.Printf("Treasury Balance : %d\n", ledger.TreasuryBalance)
+	fmt.Printf("Burned Supply    : %d\n", ledger.BurnedSupply)
+
+	// Total validator stake
+	totalStake := 0
+	maxStake := 0
+	maxAddr := ""
+	for _, v := range ledger.Validators {
+		totalStake += v.Stake
+		if v.Stake > maxStake {
+			maxStake = v.Stake
+			maxAddr = v.Address
+		}
+	}
+	fmt.Printf("Total Validators : %d\n", len(ledger.Validators))
+	fmt.Printf("Total Stake      : %d\n", totalStake)
+	if maxAddr != "" {
+		fmt.Printf("Top Validator    : %s (stake=%d)\n", maxAddr, maxStake)
+	}
+
+	// (Opsional) tampilkan beberapa saldo validator sebagai indikasi redistribusi honest
+	showN := 5
+	if showN > len(ledger.Validators) {
+		showN = len(ledger.Validators)
+	}
+	if showN > 0 {
+		fmt.Println("Sample Balances (validator):")
+		for i := 0; i < showN; i++ {
+			addr := ledger.Validators[i].Address
+			ledger.BalanceMu.RLock()
+			bal := ledger.Balances[addr]
+			ledger.BalanceMu.RUnlock()
+			fmt.Printf(" - %s : %d\n", addr, bal)
+		}
+	}
+}
+
+// ------------------- helpers -------------------
+
+func parseScope(s string) (ledger.SuspensionScope, bool) {
+	switch strings.ToLower(s) {
+	case "propose":
+		return ledger.ScopePropose, true
+	case "vote":
+		return ledger.ScopeVote, true
+	case "all":
+		return ledger.ScopeAll, true
+	default:
+		return ledger.ScopeNone, false
+	}
+}
+
+func scopeToString(sc ledger.SuspensionScope) string {
+	switch sc {
+	case ledger.ScopePropose:
+		return "propose"
+	case ledger.ScopeVote:
+		return "vote"
+	case ledger.ScopeAll:
+		return "all"
+	default:
+		return "none"
+	}
 }

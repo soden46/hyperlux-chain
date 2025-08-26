@@ -5,26 +5,25 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/soden46/hyperlux-chain/wallet"
 )
 
-// Definisi validator untuk konsensus DPoH/DPoS
+// ================== Data & Registry ==================
+
 type ValidatorDef struct {
 	Address string `json:"address"`
 	Stake   int    `json:"stake"`
 }
 
-// Daftar validator aktif
 var Validators []ValidatorDef
-
-// Peta address → wallet validator (untuk tanda tangan blok atau mini-block)
 var ValidatorWallets = map[string]*wallet.Wallet{}
 
-// AutoLoadValidatorWallets memetakan Validators ke file wallet di folder validators/
+// ================== Wallet loading helpers ==================
+
 func AutoLoadValidatorWallets() {
 	loaded := 0
-	// Coba muat berdasarkan nama file <address>.json
 	for _, v := range Validators {
 		path := filepath.Join("validators", v.Address+".json")
 		if _, err := os.Stat(path); err == nil {
@@ -35,7 +34,7 @@ func AutoLoadValidatorWallets() {
 				continue
 			}
 		}
-		// Fallback: scan semua file & cari address yang cocok
+		// Fallback scan
 		files, _ := os.ReadDir("validators")
 		found := false
 		for _, f := range files {
@@ -60,30 +59,284 @@ func AutoLoadValidatorWallets() {
 	}
 }
 
-// SlashValidator mengurangi stake (mis. untuk equivocation)
-func SlashValidator(addr string, amount int) {
-	for i := range Validators {
-		if Validators[i].Address == addr {
-			if Validators[i].Stake < amount {
-				Validators[i].Stake = 0
-			} else {
-				Validators[i].Stake -= amount
-			}
-			fmt.Printf("⛔ Validator %s di-slashed %d, stake sekarang=%d\n",
-				addr, amount, Validators[i].Stake)
-			SaveValidators()
-			return
-		}
+// ================== Status / Suspension ==================
+
+func getOrCreateRuntime(addr string) *ValidatorRuntime {
+	ValidatorStatusMu.Lock()
+	defer ValidatorStatusMu.Unlock()
+	rt, ok := ValidatorStatus[addr]
+	if !ok {
+		rt = &ValidatorRuntime{}
+		ValidatorStatus[addr] = rt
+	}
+	return rt
+}
+
+func IsSuspended(addr string, need SuspensionScope) bool {
+	ValidatorStatusMu.RLock()
+	rt, ok := ValidatorStatus[addr]
+	ValidatorStatusMu.RUnlock()
+	if !ok || rt == nil {
+		return false
+	}
+	if nowUnix() >= rt.SuspendedUntil {
+		return false
+	}
+	if rt.SuspendScope == ScopeAll {
+		return true
+	}
+	// minimal matching scope
+	if need == ScopePropose && (rt.SuspendScope == ScopePropose) {
+		return true
+	}
+	if need == ScopeVote && (rt.SuspendScope == ScopeVote) {
+		return true
+	}
+	return false
+}
+
+func SuspendValidator(addr string, scope SuspensionScope, dur time.Duration) {
+	rt := getOrCreateRuntime(addr)
+	ValidatorStatusMu.Lock()
+	rt.SuspendedUntil = time.Now().Add(dur).Unix()
+	rt.SuspendScope = scope
+	ValidatorStatusMu.Unlock()
+	fmt.Printf("⏸️ Validator %s suspended scope=%d until=%d\n", addr, scope, rt.SuspendedUntil)
+}
+
+// ================== Slashing & Distribution ==================
+
+type SlashKind int
+
+const (
+	SlashDowntime SlashKind = 1
+	SlashSafety   SlashKind = 2 // double-sign, invalid block, dsb.
+)
+
+type SlashParams struct {
+	// Absolute amount (token) to slash. Jika 0 dan Percent>0 → gunakan persentase stake.
+	Amount  int
+	Percent float64 // e.g., 0.0001 = 0.01%
+
+	// Distribusi (default 70/15/10/5 untuk safety fault)
+	BurnPct     float64 // 0.70
+	TreasuryPct float64 // 0.15
+	WhistlePct  float64 // 0.10
+	HonestPct   float64 // 0.05
+
+	Reporter       string    // optional (penerima whistle reward); jika kosong → masuk treasury
+	Kind           SlashKind // Downtime / Safety
+	CorrelationMul float64   // multiplier jika koralitif (e.g., 1.0..3.0)
+
+	// Suspension
+	SuspendScope SuspensionScope
+	SuspendFor   time.Duration
+}
+
+// Default safety policy (besar, distribusi 70/15/10/5 + suspend)
+func defaultSafetyPolicy() SlashParams {
+	return SlashParams{
+		Amount:         0,
+		Percent:        0, // jika ingin persentase, isi Percent
+		BurnPct:        0.70,
+		TreasuryPct:    0.15,
+		WhistlePct:     0.10,
+		HonestPct:      0.05,
+		Reporter:       "",
+		Kind:           SlashSafety,
+		CorrelationMul: 1.0,
+		SuspendScope:   ScopeAll,
+		SuspendFor:     24 * time.Hour,
 	}
 }
 
-// FixValidators memastikan ada validator + file wallet di folder validators/
-// - Jika kosong, generate beberapa validator default
-// - Simpan daftar Validators ke DB
+// Default downtime policy (kecil, burn semua + suspend ringan)
+func defaultDowntimePolicy() SlashParams {
+	return SlashParams{
+		Amount:         0,
+		Percent:        0.0001, // 0.01% stake
+		BurnPct:        1.0,    // burn semua
+		TreasuryPct:    0.0,
+		WhistlePct:     0.0,
+		HonestPct:      0.0,
+		Reporter:       "",
+		Kind:           SlashDowntime,
+		CorrelationMul: 1.0,
+		SuspendScope:   ScopePropose,
+		SuspendFor:     5 * time.Minute,
+	}
+}
+
+// helper: get validator index
+func findValidator(addr string) (idx int, ok bool) {
+	for i := range Validators {
+		if Validators[i].Address == addr {
+			return i, true
+		}
+	}
+	return -1, false
+}
+
+// apply slash to single addr (mutate stake)
+func slashSingle(addr string, amt int) int {
+	if amt <= 0 {
+		return 0
+	}
+	i, ok := findValidator(addr)
+	if !ok {
+		return 0
+	}
+	if Validators[i].Stake < amt {
+		amt = Validators[i].Stake
+	}
+	Validators[i].Stake -= amt
+	return amt
+}
+
+func distributeSlashed(total int, reporter string, offender string) {
+	if total <= 0 {
+		return
+	}
+	// 70% burn, 15% treasury, 10% whistle, 5% honest
+	burn := int(float64(total) * 0.70)
+	trea := int(float64(total) * 0.15)
+	whis := int(float64(total) * 0.10)
+	hon := total - burn - trea - whis // residu → honest
+
+	// update sinks
+	BurnedSupply += burn
+	TreasuryBalance += trea
+
+	// whistle
+	if reporter != "" && whis > 0 {
+		BalanceMu.Lock()
+		Balances[reporter] += whis
+		BalanceMu.Unlock()
+	} else {
+		// jika tidak ada reporter, masuk treasury
+		TreasuryBalance += whis
+		whis = 0
+	}
+
+	// honest redistribution pro-rata stake (kecuali offender)
+	if hon > 0 {
+		totalStake := 0
+		for _, v := range Validators {
+			if v.Address == offender {
+				continue
+			}
+			totalStake += v.Stake
+		}
+		if totalStake > 0 {
+			BalanceMu.Lock()
+			for _, v := range Validators {
+				if v.Address == offender {
+					continue
+				}
+				share := (hon * v.Stake) / totalStake
+				if share > 0 {
+					Balances[v.Address] += share
+				}
+			}
+			BalanceMu.Unlock()
+		} else {
+			// fallback → treasury
+			TreasuryBalance += hon
+		}
+	}
+
+	fmt.Printf("💥 Slashed=%d | burn=%d treasury=%d whistle=%d honest=%d\n", total, burn, trea, whis, hon)
+}
+
+// public: downtime slash (burn semua + suspend ringan) — SINGLE DEFINITION
+// func SlashDowntime(addr string) {
+// 	p := defaultDowntimePolicy()
+// 	ApplySlash(addr, p, "")
+// }
+
+// public: safety fault slash (amount absolute, optional reporter, correlation multiplier)
+func SlashSafetyFault(addr string, amount int, reporter string, correlationMul float64) {
+	p := defaultSafetyPolicy()
+	p.Amount = amount
+	if correlationMul > 0 {
+		p.CorrelationMul = correlationMul
+	}
+	ApplySlash(addr, p, reporter)
+}
+
+// legacy compatibility
+func SlashValidator(addr string, amount int) {
+	SlashSafetyFault(addr, amount, "", 1.0)
+}
+
+// main/sub split API (60% sub, 40% main) — untuk cluster fault
+func SlashCluster(mainAddr, subAddr string, totalAmount int, reporter string) {
+	if totalAmount <= 0 {
+		return
+	}
+	mainAmt := (totalAmount * 40) / 100
+	subAmt := totalAmount - mainAmt
+
+	// sub
+	if subAmt > 0 && subAddr != "" {
+		SlashSafetyFault(subAddr, subAmt, reporter, 1.0)
+	}
+	// main
+	if mainAmt > 0 && mainAddr != "" {
+		SlashSafetyFault(mainAddr, mainAmt, reporter, 1.0)
+	}
+}
+
+// core slashing executor
+func ApplySlash(offender string, params SlashParams, reporter string) {
+	// resolve amount
+	amt := params.Amount
+	if amt <= 0 && params.Percent > 0 {
+		if i, ok := findValidator(offender); ok {
+			amt = int(float64(Validators[i].Stake) * params.Percent)
+			if amt <= 0 && Validators[i].Stake > 0 {
+				amt = 1 // minimal 1 token
+			}
+		}
+	}
+	if params.CorrelationMul > 0 && params.CorrelationMul != 1.0 {
+		amt = int(float64(amt) * params.CorrelationMul)
+	}
+	if amt <= 0 {
+		return
+	}
+
+	// apply slash (mutate stake)
+	actual := slashSingle(offender, amt)
+	if actual <= 0 {
+		return
+	}
+	fmt.Printf("⛔ Validator %s slashed %d (kind=%d)\n", offender, actual, params.Kind)
+
+	// distribution by policy
+	switch params.Kind {
+	case SlashDowntime:
+		// burn all
+		BurnedSupply += actual
+	default:
+		// 70/15/10/5
+		distributeSlashed(actual, reporter, offender)
+	}
+
+	// suspension
+	if params.SuspendFor > 0 && params.SuspendScope != ScopeNone {
+		SuspendValidator(offender, params.SuspendScope, params.SuspendFor)
+	}
+
+	// I/O persist (opsional): SaveValidators/SaveBalances dipanggil dari luar jalur panas
+}
+
+// ================== Fix/Init Validators ==================
+
 func FixValidators() {
 	_ = os.MkdirAll("validators", 0o755)
 
-	// Jika DB belum punya daftar validator, coba load dari folder
+	// coba load dari folder jika DB kosong (LoadValidators dipanggil di luar)
 	if len(Validators) == 0 {
 		files, _ := os.ReadDir("validators")
 		for _, f := range files {
@@ -94,14 +347,14 @@ func FixValidators() {
 			if err == nil {
 				Validators = append(Validators, ValidatorDef{
 					Address: w.AddressEd,
-					Stake:   100000, // default stake
+					Stake:   100000,
 				})
 				fmt.Printf("✅ %s terdaftar (import dari %s)\n", w.AddressEd, f.Name())
 			}
 		}
 	}
 
-	// Jika tetap kosong, generate N wallet validator
+	// Jika tetap kosong → generate default N
 	if len(Validators) == 0 {
 		const N = 6
 		for i := 0; i < N; i++ {
@@ -117,14 +370,11 @@ func FixValidators() {
 		}
 	}
 
-	// Persist daftar validator
 	SaveValidators()
-
-	// Sinkronkan peta address → wallet
 	AutoLoadValidatorWallets()
 }
 
-// Utility: export validators ke JSON (opsional untuk tooling)
+// Utility export
 func ExportValidatorsJSON() []byte {
 	b, _ := json.MarshalIndent(Validators, "", "  ")
 	return b

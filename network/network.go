@@ -16,7 +16,7 @@ import (
 	"github.com/soden46/hyperlux-chain/ledger"
 )
 
-// ===== Roles =====
+// ================= Roles =================
 
 type Role string
 
@@ -27,12 +27,12 @@ const (
 	RoleSub    Role = "sub"
 )
 
-// ===== Peer registry (persisted) =====
+// ================= Peer registry (persisted) =================
 
 type PeerInfo struct {
 	ID   string `json:"id"`
 	Role Role   `json:"role"`
-	Addr string `json:"addr,omitempty"` // multiaddr, jika ada
+	Addr string `json:"addr,omitempty"`
 	Seen int64  `json:"seen"`
 	Boot bool   `json:"boot"`
 }
@@ -46,7 +46,7 @@ var (
 	peersFile         = "peers.json"
 )
 
-// ===== TX Ingress partitioning =====
+// ================= TX ingress partitioning =================
 
 var (
 	shardCh     []chan ledger.Transaction
@@ -57,13 +57,13 @@ var (
 	ingressDropped  uint64
 )
 
-// ===== QoS lanes (token bucket) =====
+// ================= QoS lanes (token bucket) =================
 
 type tokenBucket struct {
 	mu      sync.Mutex
 	tokens  float64
 	lastRef time.Time
-	rate    float64 // tokens per second
+	rate    float64
 	burst   float64
 }
 
@@ -89,7 +89,6 @@ func (b *tokenBucket) allow(weight float64) bool {
 	return true
 }
 
-// Lanes: fast / normal / slow
 const (
 	feeHigh = 5000
 	feeMid  = 1200
@@ -101,7 +100,7 @@ var (
 	bucketSlow   = newBucket(600, 1200)
 )
 
-// ===== Public helpers =====
+// ================= Public helpers =================
 
 func GetRole() Role     { return currentRole }
 func GetNodeID() string { return nodeID }
@@ -116,7 +115,7 @@ func ListPeers() []PeerInfo {
 	return out
 }
 
-// ===== Init =====
+// ================= Init =================
 
 func InitNetwork() {
 	// Node ID
@@ -138,13 +137,12 @@ func InitNetwork() {
 		currentRole = RolePublic
 	}
 
-	// Load peer list (persisted)
+	// Load peer list
 	loadPeers()
-
-	// Register self (and persist)
+	// Register self
 	registerSelf("", currentRole, currentRole == RoleBoot)
 
-	// Start P2P (QUIC + GossipSub) — fallback ke stub bila tidak dibuild dengan tag p2p
+	// Start P2P (libp2p) — gunakan stub jika tidak di-enable
 	bootAddrs := getBootstrapAddrs()
 	if err := StartP2P(bootAddrs); err != nil {
 		fmt.Println("⚠️ P2P disabled (fallback in-memory):", err)
@@ -152,16 +150,16 @@ func InitNetwork() {
 		fmt.Printf("🌐 P2P online with %d bootstrap addrs\n", len(bootAddrs))
 	}
 
-	// Start gossip handlers (akan local-only bila P2P tidak aktif)
+	// Gossip handlers (local-only bila P2P mati)
 	StartGossip()
 
-	// Start partitioned TX ingress workers
+	// Partitioned TX ingress
 	startIngress()
 
 	fmt.Printf("🌐 Network initialized: id=%s role=%s\n", nodeID, currentRole)
 }
 
-// ===== Peer persistence =====
+// ================= Peer persistence =================
 
 func loadPeers() {
 	data, err := os.ReadFile(peersFile)
@@ -227,7 +225,7 @@ func getBootstrapAddrs() []string {
 	return out
 }
 
-// ===== TX ingress partitioning =====
+// ================= TX ingress partitioning =================
 
 func startIngress() {
 	ingressOnce.Do(func() {
@@ -258,7 +256,7 @@ func shardFor(key string) int {
 	return int(h.Sum32()) % numShards
 }
 
-// ===== QoS / Gateway =====
+// ================= QoS / Gateway =================
 
 func isValidator(addr string) (bool, int) {
 	for _, v := range ledger.Validators {
@@ -287,12 +285,13 @@ func laneFor(tx ledger.Transaction) (bucket *tokenBucket, weight float64) {
 }
 
 func GatewayAcceptTx(tx ledger.Transaction) error {
-	// Non-public node → langsung antrikan
+	// Non-public node → langsung antrikan (di-shard sesuai sender)
 	if currentRole != RolePublic {
 		enqueueShard(tx)
 		atomic.AddUint64(&ingressAccepted, 1)
 		return nil
 	}
+	// QoS lanes + stake-weighted burst
 	b, w := laneFor(tx)
 	if !b.allow(w) {
 		atomic.AddUint64(&ingressDropped, 1)
@@ -315,7 +314,7 @@ func enqueueShard(tx ledger.Transaction) {
 	}
 }
 
-// ===== Stats =====
+// ================= Stats =================
 
 func GatewayStats() (accepted, dropped uint64) {
 	return atomic.LoadUint64(&ingressAccepted), atomic.LoadUint64(&ingressDropped)

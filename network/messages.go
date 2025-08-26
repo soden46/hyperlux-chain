@@ -56,7 +56,7 @@ func PublishMiniBlock(mb MiniBlock) {
 	case miniBlockBus <- mb:
 	default:
 	}
-	_ = PublishMiniBlockP2P(mb) // best-effort
+	_ = PublishMiniBlockP2P(mb) // no-op jika P2P dimatikan
 }
 
 func CollectMiniBlocks(slot string, timeout time.Duration) []MiniBlock {

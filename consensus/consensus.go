@@ -18,21 +18,19 @@ import (
 var lastBlockTime int64
 var lastTPS float64
 
-const (
-	// Target block time; sesuaikan sesuai throughput
-	BlockTime = 350 * time.Millisecond
-)
+const BlockTime = 350 * time.Millisecond
 
 var (
 	// PoH state
 	pohChain []string
-	pohSlot  int64 = 0
+	pohSlot  int64
 
-	// DPoS state (top-N by stake)
+	// DPoS delegates (top-N)
 	Delegates []string
 )
 
-// InitConsensus → inisialisasi semua modul DPoH (PoH + DPoS + BFT)
+// ===================== Init =====================
+
 func InitConsensus() {
 	fmt.Println("⚡ Consensus engine initialized")
 
@@ -46,11 +44,8 @@ func InitConsensus() {
 	} else {
 		fmt.Printf("✅ Loaded %d validators from DB\n", len(ledger.Validators))
 	}
-
-	// pastikan wallet validator termuat
 	ledger.AutoLoadValidatorWallets()
 
-	// mulai block producer loop
 	go blockProducer()
 	fmt.Println("✅ Consensus modules ready")
 }
@@ -58,14 +53,13 @@ func InitConsensus() {
 func blockProducer() {
 	ticker := time.NewTicker(BlockTime)
 	defer ticker.Stop()
-
 	for range ticker.C {
 		CommitBlock()
 	}
 }
 
-// CommitBlock → ambil snapshot mempool, proses paralel (anti konflik),
-// commit ke state sekali, buat block, lalu bersihkan mempool selektif.
+// ===================== CommitBlock =====================
+
 func CommitBlock() {
 	start := time.Now()
 
@@ -74,15 +68,15 @@ func CommitBlock() {
 		return
 	}
 
-	// PoH next slot
+	// PoH slot
 	slotHash := nextPoH("block-commit")
 
-	// pilih validator berbobot stake (VRF sederhana dari slotHash)
+	// pilih validator via VRF + skip yang disuspend (propose)
 	if len(ledger.Validators) == 0 {
 		fmt.Println("⚠️ No validators registered")
 		return
 	}
-	validator := selectValidatorVRF(slotHash)
+	validator := selectValidatorVRFEligible(slotHash)
 	valWallet := ledger.ValidatorWallets[validator.Address]
 	if valWallet == nil {
 		fmt.Printf("❌ Wallet not found for validator %s\n", validator.Address)
@@ -92,30 +86,25 @@ func CommitBlock() {
 	fmt.Printf("🎲 Selected proposer: %s (stake=%d) | slotHash=%.12s...\n",
 		validator.Address, validator.Stake, slotHash)
 
-	// BFT vote simulasi
+	// BFT vote (skip voter if suspended for vote)
 	if !bftVote(slotHash, ledger.Validators) {
 		fmt.Println("❌ Block rejected by BFT")
+		// Penalti ringan default untuk ilustrasi
 		ledger.SlashValidator(validator.Address, 10)
 		return
 	}
 
-	// Ambil snapshot mempool (tanpa argumen)
+	// Snapshot & process
 	snap := ledger.MempoolSnapshot()
-
-	// Proses paralel + commit state sekali di akhir
 	validTxs := ledger.ProcessTxListParallel(snap)
 
-	// Buat block dari transaksi valid
+	// Build block & broadcast
 	newBlock := ledger.AddBlockWithTxs(&validator, valWallet, validTxs)
-
-	// Bersihkan mempool hanya TX yang sudah committed
 	ledger.RemoveCommittedFromMempool(validTxs)
-
-	// Checkpoint & siar ke jaringan (stub p2p aman untuk lokal)
 	ledger.AddCheckpoint(newBlock)
 	network.BroadcastBlock(newBlock)
 
-	// Profiling helper
+	// Profiling
 	elapsed := time.Since(start)
 	mempoolAfter := ledger.GetMempoolSize()
 	fmt.Printf("📈 Profiling → Goroutines=%d | Mempool(before)=%d after=%d | Latency=%.3fms | BlockTx=%d\n",
@@ -124,7 +113,7 @@ func CommitBlock() {
 	printMetrics(newBlock)
 }
 
-// ===================== DPoS (delegates) + VRF selection =====================
+// ===================== DPoS + VRF =====================
 
 func initDPoS() {
 	ledger.LoadValidators()
@@ -146,7 +135,6 @@ func initDPoS() {
 	fmt.Printf("⚡ DPoS Consensus initialized with %d delegates\n", len(Delegates))
 }
 
-// selectValidatorVRF → pilih validator proporsional stake via slotHash
 func selectValidatorVRF(seed string) ledger.ValidatorDef {
 	hash := sha256.Sum256([]byte(seed))
 	rnd := new(big.Int).SetBytes(hash[:])
@@ -168,6 +156,21 @@ func selectValidatorVRF(seed string) ledger.ValidatorDef {
 		}
 	}
 	return ledger.Validators[0]
+}
+
+// pilih yang eligible (tidak suspended untuk propose). Jika terpilih suspended, linear-scan berikutnya.
+func selectValidatorVRFEligible(seed string) ledger.ValidatorDef {
+	pick := selectValidatorVRF(seed)
+	if !ledger.IsSuspended(pick.Address, ledger.ScopePropose) {
+		return pick
+	}
+	// fallback linear scan
+	for _, v := range ledger.Validators {
+		if !ledger.IsSuspended(v.Address, ledger.ScopePropose) {
+			return v
+		}
+	}
+	return pick
 }
 
 // ===================== PoH =====================
@@ -210,6 +213,10 @@ func bftVote(blockHash string, validators []ledger.ValidatorDef) bool {
 	results := make(chan bool, len(validators))
 
 	for _, v := range validators {
+		// skip voter suspended
+		if ledger.IsSuspended(v.Address, ledger.ScopeVote) || ledger.IsSuspended(v.Address, ledger.ScopeAll) {
+			continue
+		}
 		wg.Add(1)
 		go func(val ledger.ValidatorDef) {
 			defer wg.Done()
@@ -243,10 +250,7 @@ func bftVote(blockHash string, validators []ledger.ValidatorDef) bool {
 	return false
 }
 
-// validateBlock → placeholder validasi blok (signature, PoH, dll.)
-func validateBlock(_ string) bool {
-	return true
-}
+func validateBlock(_ string) bool { return true }
 
 // ===================== Metrics =====================
 

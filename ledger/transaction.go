@@ -26,7 +26,6 @@ type Transaction struct {
 
 // ===================== TX Construction =====================
 
-// NewTransaction → buat TX baru (fee super murah berbasis ukuran, mirip Solana)
 func NewTransaction(w *wallet.Wallet, to string, amount int) Transaction {
 	nonce := GetNextNonce(w.AddressEd)
 
@@ -45,19 +44,16 @@ func NewTransaction(w *wallet.Wallet, to string, amount int) Transaction {
 	return tx
 }
 
-// GetNextNonce → baca nonce (thread-safe)
 func GetNextNonce(addr string) int {
 	NonceTableMu.RLock()
 	defer NonceTableMu.RUnlock()
 	return NonceTable[addr] + 1
 }
 
-// ===================== Mempool Ops (ingest) =====================
+// ===================== Mempool Ingest =====================
 
-// ValidateAndAddToMempool → validasi dasar, masukkan ke mempool.
-// Tidak mengubah Balances/NonceTable: itu dilakukan saat block commit.
 func ValidateAndAddToMempool(tx Transaction) error {
-	// Snapshot cepat untuk expected nonce & balance
+	// quick snapshot
 	NonceTableMu.RLock()
 	expected := NonceTable[tx.From] + 1
 	NonceTableMu.RUnlock()
@@ -82,9 +78,8 @@ func ValidateAndAddToMempool(tx Transaction) error {
 	return nil
 }
 
-// ===================== Mempool Helpers (untuk consensus) =====================
+// ===================== Mempool Helpers =====================
 
-// MempoolSnapshot → salin seluruh mempool saat ini (thread-safe)
 func MempoolSnapshot() []Transaction {
 	MempoolMu.RLock()
 	defer MempoolMu.RUnlock()
@@ -93,12 +88,10 @@ func MempoolSnapshot() []Transaction {
 	return out
 }
 
-// RemoveCommittedFromMempool → hapus TX yang sudah masuk block dari mempool
 func RemoveCommittedFromMempool(committed []Transaction) {
 	if len(committed) == 0 {
 		return
 	}
-	// Buat set hash TX yang masuk block
 	toDelete := make(map[string]struct{}, len(committed))
 	for _, tx := range committed {
 		toDelete[HashTransaction(tx)] = struct{}{}
@@ -116,33 +109,34 @@ func RemoveCommittedFromMempool(committed []Transaction) {
 			filtered = append(filtered, tx)
 		}
 	}
-	// shrink jika perlu
 	Mempool = filtered
 }
 
-// ===================== Batch Processing (untuk consensus) =====================
+func ClearMempool() {
+	MempoolMu.Lock()
+	Mempool = []Transaction{}
+	MempoolMu.Unlock()
+}
 
-// ProcessTxListParallel → validasi batch (partisi by sender, anti konflik nonce),
-// eksekusi paralel, lalu COMMIT ke state global SEKALI di akhir.
-// Return daftar TX yang benar-benar valid untuk dimasukkan ke block.
+// ===================== Batch Processing =====================
+
 func ProcessTxListParallel(txs []Transaction) []Transaction {
 	if len(txs) == 0 {
 		return []Transaction{}
 	}
 
-	// Partisi by sender → minim konflik nonce
+	// Partition by sender → minimize nonce conflicts
 	partitions := map[string][]Transaction{}
 	for _, tx := range txs {
 		partitions[tx.From] = append(partitions[tx.From], tx)
 	}
-	// Urutkan tiap partisi by nonce ascending
 	for sender := range partitions {
 		sort.Slice(partitions[sender], func(i, j int) bool {
 			return partitions[sender][i].Nonce < partitions[sender][j].Nonce
 		})
 	}
 
-	// Snapshot nonce sender & saldo sender (yang dibutuhkan untuk debit)
+	// snapshot nonces & balances
 	nonceSnap := make(map[string]int, len(partitions))
 	balSnap := make(map[string]int, len(partitions))
 
@@ -158,7 +152,6 @@ func ProcessTxListParallel(txs []Transaction) []Transaction {
 	}
 	BalanceMu.RUnlock()
 
-	// Worker pool dinamis
 	numWorkers := runtime.NumCPU()
 	if numWorkers > len(partitions) {
 		numWorkers = len(partitions)
@@ -186,20 +179,16 @@ func ProcessTxListParallel(txs []Transaction) []Transaction {
 			localBal := balSnap[j.sender]
 
 			for _, tx := range j.txs {
-				// Nonce harus berurutan (monotonik per pengirim)
 				if tx.Nonce != localNonce+1 {
 					break
 				}
-				// Verifikasi tanda tangan
 				if !VerifyTransaction(tx) {
 					break
 				}
-				// Cek cukup saldo (debit + fee)
 				cost := tx.Amount + tx.Fee
 				if localBal < cost {
 					break
 				}
-				// terima & update local view
 				localBal -= cost
 				localNonce = tx.Nonce
 				accepted = append(accepted, tx)
@@ -221,7 +210,7 @@ func ProcessTxListParallel(txs []Transaction) []Transaction {
 	}
 	close(out)
 
-	// Commit ke state global SEKALI (minimize contention)
+	// single commit
 	if len(final) > 0 {
 		BalanceMu.Lock()
 		NonceTableMu.Lock()
@@ -237,17 +226,9 @@ func ProcessTxListParallel(txs []Transaction) []Transaction {
 	return final
 }
 
-// ProcessMempoolParallel → wrapper nyaman untuk memproses snapshot mempool
 func ProcessMempoolParallel() []Transaction {
 	snap := MempoolSnapshot()
 	return ProcessTxListParallel(snap)
-}
-
-// ClearMempool → reset penuh (biasanya tidak perlu jika kita selective remove)
-func ClearMempool() {
-	MempoolMu.Lock()
-	Mempool = []Transaction{}
-	MempoolMu.Unlock()
 }
 
 // ===================== Utils =====================
@@ -255,7 +236,7 @@ func ClearMempool() {
 func CalculateFee(tx Transaction) int {
 	b, _ := json.Marshal(tx)
 	size := len(b)
-	feePerByte := 1 // super murah, bisa dituning sesuai ekonomi jaringan
+	feePerByte := 1 // super murah (bisa dituning)
 	return size * feePerByte
 }
 
