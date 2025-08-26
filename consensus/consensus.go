@@ -15,9 +15,6 @@ import (
 	"github.com/soden46/hyperlux-chain/network"
 )
 
-var lastBlockTime int64
-var lastTPS float64
-
 const BlockTime = 350 * time.Millisecond
 
 var (
@@ -27,6 +24,13 @@ var (
 
 	// DPoS delegates (top-N)
 	Delegates []string
+
+	// metrics (berbasis wall-clock, bukan height delta)
+	lastBlockWall time.Time
+	lastTPS       float64
+
+	// reentrancy guard: hindari CommitBlock overlap (auto-commit vs ticker)
+	committing int32
 )
 
 // ===================== Init =====================
@@ -61,6 +65,12 @@ func blockProducer() {
 // ===================== CommitBlock =====================
 
 func CommitBlock() {
+	// hindari overlap
+	if !atomic.CompareAndSwapInt32(&committing, 0, 1) {
+		return
+	}
+	defer atomic.StoreInt32(&committing, 0)
+
 	start := time.Now()
 
 	mempoolBefore := ledger.GetMempoolSize()
@@ -71,7 +81,7 @@ func CommitBlock() {
 	// PoH slot
 	slotHash := nextPoH("block-commit")
 
-	// pilih validator via VRF + skip yang disuspend (propose)
+	// pilih proposer via VRF + skip yang suspended (propose)
 	if len(ledger.Validators) == 0 {
 		fmt.Println("⚠️ No validators registered")
 		return
@@ -86,15 +96,14 @@ func CommitBlock() {
 	fmt.Printf("🎲 Selected proposer: %s (stake=%d) | slotHash=%.12s...\n",
 		validator.Address, validator.Stake, slotHash)
 
-	// BFT vote (skip voter if suspended for vote)
+	// BFT vote (skip voter yang suspended vote/all)
 	if !bftVote(slotHash, ledger.Validators) {
 		fmt.Println("❌ Block rejected by BFT")
-		// Penalti ringan default untuk ilustrasi
-		ledger.SlashValidator(validator.Address, 10)
+		ledger.SlashValidator(validator.Address, 10) // contoh penalti ringan
 		return
 	}
 
-	// Snapshot & process
+	// Snapshot & eksekusi paralel (mutasi state dilakukan di executor)
 	snap := ledger.MempoolSnapshot()
 	validTxs := ledger.ProcessTxListParallel(snap)
 
@@ -158,13 +167,12 @@ func selectValidatorVRF(seed string) ledger.ValidatorDef {
 	return ledger.Validators[0]
 }
 
-// pilih yang eligible (tidak suspended untuk propose). Jika terpilih suspended, linear-scan berikutnya.
+// pilih validator eligible (tidak suspended propose). Jika pick suspended → fallback linear scan
 func selectValidatorVRFEligible(seed string) ledger.ValidatorDef {
 	pick := selectValidatorVRF(seed)
 	if !ledger.IsSuspended(pick.Address, ledger.ScopePropose) {
 		return pick
 	}
-	// fallback linear scan
 	for _, v := range ledger.Validators {
 		if !ledger.IsSuspended(v.Address, ledger.ScopePropose) {
 			return v
@@ -213,7 +221,6 @@ func bftVote(blockHash string, validators []ledger.ValidatorDef) bool {
 	results := make(chan bool, len(validators))
 
 	for _, v := range validators {
-		// skip voter suspended
 		if ledger.IsSuspended(v.Address, ledger.ScopeVote) || ledger.IsSuspended(v.Address, ledger.ScopeAll) {
 			continue
 		}
@@ -255,18 +262,23 @@ func validateBlock(_ string) bool { return true }
 // ===================== Metrics =====================
 
 func printMetrics(newBlock ledger.Block) {
-	now := time.Now().Unix()
-	if lastBlockTime > 0 {
-		bt := now - lastBlockTime
-		if bt > 0 {
-			lastTPS = float64(len(newBlock.Transactions)) / float64(bt)
+	now := time.Now()
+	if !lastBlockWall.IsZero() {
+		dt := now.Sub(lastBlockWall).Seconds()
+		if dt <= 0 {
+			dt = 1e-6
 		}
-		fmt.Printf("📊 Metrics → BlockTime=%ds, TPS=%.2f, Finality=BFT instant\n",
-			now-lastBlockTime, lastTPS)
+		lastTPS = float64(len(newBlock.Transactions)) / dt
+		fmt.Printf("📊 Metrics → BlockTime=%.2fs, TPS=%.2f, Finality=BFT instant\n", dt, lastTPS)
 	}
-	lastBlockTime = now
+	lastBlockWall = now
 }
 
-func GetLastBlockTime() int64   { return lastBlockTime }
+func GetLastBlockTime() int64 {
+	if lastBlockWall.IsZero() {
+		return 0
+	}
+	return int64(time.Since(lastBlockWall).Seconds())
+}
 func GetLastTPS() float64       { return lastTPS }
 func GetFinalityStatus() string { return "BFT instant" }

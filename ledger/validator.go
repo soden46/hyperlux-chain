@@ -17,8 +17,12 @@ type ValidatorDef struct {
 	Stake   int    `json:"stake"`
 }
 
-var Validators []ValidatorDef
-var ValidatorWallets = map[string]*wallet.Wallet{}
+var (
+	Validators       []ValidatorDef
+	ValidatorWallets = map[string]*wallet.Wallet{}
+)
+
+const validatorsDBFile = "validators.json"
 
 // ================== Wallet loading helpers ==================
 
@@ -59,6 +63,30 @@ func AutoLoadValidatorWallets() {
 	}
 }
 
+// ================== Load/Save Validators ==================
+
+func LoadValidators() {
+	data, err := os.ReadFile(validatorsDBFile)
+	if err != nil {
+		return
+	}
+	var list []ValidatorDef
+	if err := json.Unmarshal(data, &list); err != nil {
+		fmt.Println("⚠️ LoadValidators warn:", err)
+		return
+	}
+	Validators = list
+}
+
+func SaveValidators() {
+	b, err := json.MarshalIndent(Validators, "", "  ")
+	if err != nil {
+		fmt.Println("⚠️ SaveValidators warn:", err)
+		return
+	}
+	_ = os.WriteFile(validatorsDBFile, b, 0644)
+}
+
 // ================== Status / Suspension ==================
 
 func getOrCreateRuntime(addr string) *ValidatorRuntime {
@@ -85,7 +113,6 @@ func IsSuspended(addr string, need SuspensionScope) bool {
 	if rt.SuspendScope == ScopeAll {
 		return true
 	}
-	// minimal matching scope
 	if need == ScopePropose && (rt.SuspendScope == ScopePropose) {
 		return true
 	}
@@ -109,8 +136,8 @@ func SuspendValidator(addr string, scope SuspensionScope, dur time.Duration) {
 type SlashKind int
 
 const (
-	SlashDowntime SlashKind = 1
-	SlashSafety   SlashKind = 2 // double-sign, invalid block, dsb.
+	SlashKindDowntime SlashKind = 1
+	SlashKindSafety   SlashKind = 2 // double-sign, invalid block, dsb.
 )
 
 type SlashParams struct {
@@ -133,24 +160,22 @@ type SlashParams struct {
 	SuspendFor   time.Duration
 }
 
-// Default safety policy (besar, distribusi 70/15/10/5 + suspend)
 func defaultSafetyPolicy() SlashParams {
 	return SlashParams{
 		Amount:         0,
-		Percent:        0, // jika ingin persentase, isi Percent
+		Percent:        0,
 		BurnPct:        0.70,
 		TreasuryPct:    0.15,
 		WhistlePct:     0.10,
 		HonestPct:      0.05,
 		Reporter:       "",
-		Kind:           SlashSafety,
+		Kind:           SlashKindSafety,
 		CorrelationMul: 1.0,
 		SuspendScope:   ScopeAll,
 		SuspendFor:     24 * time.Hour,
 	}
 }
 
-// Default downtime policy (kecil, burn semua + suspend ringan)
 func defaultDowntimePolicy() SlashParams {
 	return SlashParams{
 		Amount:         0,
@@ -160,14 +185,13 @@ func defaultDowntimePolicy() SlashParams {
 		WhistlePct:     0.0,
 		HonestPct:      0.0,
 		Reporter:       "",
-		Kind:           SlashDowntime,
+		Kind:           SlashKindDowntime,
 		CorrelationMul: 1.0,
 		SuspendScope:   ScopePropose,
 		SuspendFor:     5 * time.Minute,
 	}
 }
 
-// helper: get validator index
 func findValidator(addr string) (idx int, ok bool) {
 	for i := range Validators {
 		if Validators[i].Address == addr {
@@ -177,7 +201,6 @@ func findValidator(addr string) (idx int, ok bool) {
 	return -1, false
 }
 
-// apply slash to single addr (mutate stake)
 func slashSingle(addr string, amt int) int {
 	if amt <= 0 {
 		return 0
@@ -248,13 +271,13 @@ func distributeSlashed(total int, reporter string, offender string) {
 	fmt.Printf("💥 Slashed=%d | burn=%d treasury=%d whistle=%d honest=%d\n", total, burn, trea, whis, hon)
 }
 
-// public: downtime slash (burn semua + suspend ringan) — SINGLE DEFINITION
-// func SlashDowntime(addr string) {
-// 	p := defaultDowntimePolicy()
-// 	ApplySlash(addr, p, "")
-// }
+// === Public helpers (HANYA SATU DEFINISI) ===
 
-// public: safety fault slash (amount absolute, optional reporter, correlation multiplier)
+func SlashDowntime(addr string) {
+	p := defaultDowntimePolicy()
+	ApplySlash(addr, p, "")
+}
+
 func SlashSafetyFault(addr string, amount int, reporter string, correlationMul float64) {
 	p := defaultSafetyPolicy()
 	p.Amount = amount
@@ -264,12 +287,10 @@ func SlashSafetyFault(addr string, amount int, reporter string, correlationMul f
 	ApplySlash(addr, p, reporter)
 }
 
-// legacy compatibility
 func SlashValidator(addr string, amount int) {
 	SlashSafetyFault(addr, amount, "", 1.0)
 }
 
-// main/sub split API (60% sub, 40% main) — untuk cluster fault
 func SlashCluster(mainAddr, subAddr string, totalAmount int, reporter string) {
 	if totalAmount <= 0 {
 		return
@@ -315,7 +336,7 @@ func ApplySlash(offender string, params SlashParams, reporter string) {
 
 	// distribution by policy
 	switch params.Kind {
-	case SlashDowntime:
+	case SlashKindDowntime:
 		// burn all
 		BurnedSupply += actual
 	default:
@@ -328,7 +349,7 @@ func ApplySlash(offender string, params SlashParams, reporter string) {
 		SuspendValidator(offender, params.SuspendScope, params.SuspendFor)
 	}
 
-	// I/O persist (opsional): SaveValidators/SaveBalances dipanggil dari luar jalur panas
+	SaveValidators()
 }
 
 // ================== Fix/Init Validators ==================

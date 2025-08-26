@@ -726,7 +726,7 @@ func handleSlash() {
 
 	ledger.SlashSafetyFault(addr, amount, reporter, 1.0)
 	// persist perubahan stake + distribusi hadiah ke balance
-	ledger.SaveValidators()
+	ledger.SaveValidators() // <— HILANGKAN `_ =`
 	ledger.SaveBalances()
 
 	fmt.Printf("✅ Slash sukses. Offender=%s amount=%d reporter=%s\n", addr, amount, reporter)

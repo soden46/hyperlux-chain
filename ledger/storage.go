@@ -11,7 +11,7 @@ import (
 
 var (
 	db   *leveldb.DB
-	dbMu sync.Mutex // serialize open/close per process
+	dbMu sync.Mutex
 )
 
 // InitDB buka LevelDB satu kali
@@ -29,7 +29,7 @@ func InitDB() {
 	fmt.Println("✅ Storage engine initialized")
 }
 
-// ================= BALANCES =================
+// ===== BALANCES =====
 func SaveBalances() {
 	InitDB()
 	BalanceMu.RLock()
@@ -46,7 +46,7 @@ func LoadBalances() {
 	}
 }
 
-// ================= BLOCKCHAIN =================
+// ===== BLOCKCHAIN =====
 func SaveBlockchain() {
 	InitDB()
 	data, _ := json.Marshal(Blockchain)
@@ -61,7 +61,7 @@ func LoadBlockchain() {
 	}
 }
 
-// ================= MEMPOOL =================
+// ===== MEMPOOL =====
 func SaveMempool() {
 	InitDB()
 	MempoolMu.RLock()
@@ -78,7 +78,7 @@ func LoadMempool() {
 	}
 }
 
-// ================= NONCE TABLE =================
+// ===== NONCE TABLE =====
 func SaveNonceTable() {
 	InitDB()
 	NonceTableMu.RLock()
@@ -92,20 +92,5 @@ func LoadNonceTable() {
 	data, _ := db.Get([]byte("nonce_table"), nil)
 	if len(data) > 0 {
 		_ = json.Unmarshal(data, &NonceTable)
-	}
-}
-
-// ================= VALIDATORS =================
-func SaveValidators() {
-	InitDB()
-	data, _ := json.Marshal(Validators)
-	_ = db.Put([]byte("validators"), data, nil)
-}
-
-func LoadValidators() {
-	InitDB()
-	data, _ := db.Get([]byte("validators"), nil)
-	if len(data) > 0 {
-		_ = json.Unmarshal(data, &Validators)
 	}
 }
